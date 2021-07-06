@@ -1,6 +1,7 @@
-use anyhow::{Error, Result};
+use anyhow::Result;
 use git2::{ObjectType, Oid, Repository, ResetType};
-use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 
 fn num_leading_zero_bits(oid: &Oid) -> u32 {
     let mut zeros = 0;
@@ -51,21 +52,42 @@ fn try_commit(mut buf: String, target_zeros: u32) -> Result<(String, Oid)> {
         }
     };
 
-    let good_nonce = (0..u128::MAX)
-        .into_par_iter()
-        .find_any(|&nonce| {
-            let mut buf = buf.clone();
-            write_nonce(&mut buf, nonce_start, nonce);
-            let hash = Oid::hash_object(ObjectType::Commit, buf.as_bytes()).unwrap();
-            let zeros = num_leading_zero_bits(&hash);
-            zeros >= target_zeros
-        })
-        .ok_or("Hash not found")
-        .map_err(Error::msg)?;
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let num_hashes = Arc::new(AtomicU64::new(0));
 
-    write_nonce(&mut buf, nonce_start, good_nonce);
+    let n = num_cpus::get() as u128;
+    let chunk_size = u128::MAX / n;
+    for i in 0..n {
+        let tx = tx.clone();
+        let stop = Arc::clone(&stop);
+        let num_hashes = Arc::clone(&num_hashes);
+        let mut buf = buf.clone();
+        std::thread::spawn(move || {
+            for nonce in i * chunk_size..(i + 1) * chunk_size {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                num_hashes.fetch_add(1, Ordering::Relaxed);
+                write_nonce(&mut buf, nonce_start, nonce);
+                let hash = Oid::hash_object(ObjectType::Commit, buf.as_bytes()).unwrap();
+                let zeros = num_leading_zero_bits(&hash);
+                if zeros >= target_zeros {
+                    tx.send(buf).unwrap();
+                    break;
+                }
+            }
+        });
+    }
+    let buf = rx.recv()?;
+    stop.store(true, Ordering::Relaxed);
+
     let hash = Oid::hash_object(ObjectType::Commit, buf.as_bytes())?;
-    println!("{} {}", good_nonce, num_leading_zero_bits(&hash));
+    println!(
+        "{} {}",
+        num_hashes.load(Ordering::Relaxed),
+        num_leading_zero_bits(&hash)
+    );
     println!("{}", buf);
     Ok((buf, hash))
 }
@@ -77,7 +99,7 @@ fn main() -> Result<()> {
     let commit_data = odb.read(head_commit_hash)?.data().iter().cloned().collect();
     let buf = String::from_utf8(commit_data)?;
 
-    let target_zeros = 24;
+    let target_zeros = 28;
     let (buf, hash) = try_commit(buf.clone(), target_zeros)?;
     odb.write(ObjectType::Commit, buf.as_bytes())?;
     repo.reset(&repo.find_object(hash, None)?, ResetType::Soft, None)?;
