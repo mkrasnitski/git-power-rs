@@ -1,13 +1,6 @@
 use anyhow::{Error, Result};
-use git2::{Buf, Commit, ObjectType, Oid, Repository, ResetType, Time};
+use git2::{Commit, ObjectType, Oid, Repository, ResetType};
 use std::io::Write;
-use std::ops::Deref;
-
-const TZ_OFFSETS: [i32; 38] = [
-    -720, -660, -600, -570, -540, -480, -420, -360, -300, -240, -210, -180, -120, -60, 0, 60, 120,
-    180, 210, 240, 270, 300, 330, 345, 360, 390, 420, 480, 525, 540, 570, 600, 630, 660, 720, 765,
-    780, 840,
-];
 
 trait ValidUTF8<T> {
     fn valid_utf8(self) -> Result<T>
@@ -18,72 +11,6 @@ trait ValidUTF8<T> {
 impl<'a> ValidUTF8<&'a str> for Option<&'a str> {
     fn valid_utf8(self) -> Result<&'a str> {
         self.ok_or("Invalid UTF-8").map_err(Error::msg)
-    }
-}
-
-fn timestamp_string(time: i64, offset: i32) -> String {
-    let t = Time::new(time, offset);
-    let offset = t.offset_minutes().abs();
-    format!(
-        "{} {}{:02}{:02}",
-        t.seconds(),
-        t.sign(),
-        offset / 60,
-        offset % 60
-    )
-}
-
-struct CommitBufferStr<'repo> {
-    repo: &'repo Repository,
-    buf: String,
-}
-
-impl<'repo> CommitBufferStr<'repo> {
-    fn new(repo: &'repo Repository, b: Buf) -> Result<Self> {
-        Ok(Self {
-            repo,
-            buf: b.as_str().valid_utf8()?.to_owned(),
-        })
-    }
-
-    fn author_timestamp(&mut self) -> &mut [u8] {
-        let start = self.buf.find('>').unwrap() + 2;
-        let end = start + self.buf[start..].find('\n').unwrap();
-        // SAFETY: The timestamp will always be valid UTF-8
-        unsafe { self.buf[start..end].as_bytes_mut() }
-    }
-
-    fn set_author_timestamp(&mut self, time: i64, offset: i32) {
-        self.author_timestamp()
-            .copy_from_slice(timestamp_string(time, offset).as_bytes());
-    }
-
-    fn committer_timestamp(&mut self) -> &mut [u8] {
-        let start = self.buf.find('>').unwrap() + 2;
-        let start = start + self.buf[start..].find('>').unwrap() + 2;
-        let end = start + self.buf[start..].find('\n').unwrap();
-        // SAFETY: The timestamp will always be valid UTF-8
-        unsafe { self.buf[start..end].as_bytes_mut() }
-    }
-
-    fn set_committer_timestamp(&mut self, time: i64, offset: i32) {
-        self.committer_timestamp()
-            .copy_from_slice(timestamp_string(time, offset).as_bytes());
-    }
-
-    fn write_to_odb(&self) -> Result<()> {
-        let odb = self.repo.odb()?;
-        let mut writer = odb.writer(self.buf.len(), ObjectType::Commit)?;
-        writer.write(&self.buf.as_bytes())?;
-        writer.finalize()?;
-        Ok(())
-    }
-}
-
-impl Deref for CommitBufferStr<'_> {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
-        &self.buf
     }
 }
 
@@ -98,12 +25,22 @@ fn num_leading_zero_bits(oid: &Oid) -> u32 {
     zeros
 }
 
+fn nonce_string(nonce: u128) -> String {
+    let alphabet = "ABCDEFGHIJKLMNOP";
+    let mut nonce_string = String::new();
+    for i in 0..40 {
+        // prevents weird bitshift overflows, but only covers 128/160 bits of entropy
+        let idx = if i < 32 { (nonce >> (4 * i)) & 0xF } else { 0 };
+        nonce_string.insert(0, alphabet.chars().nth(idx as usize).unwrap());
+    }
+    nonce_string
+}
+
 fn try_commit(repo: &Repository, c: &Commit, target_zeros: u32) -> Result<Oid> {
     let author = c.author();
     let committer = c.committer();
-    let mut buf = CommitBufferStr::new(
-        &repo,
-        repo.commit_create_buffer(
+    let mut buf = repo
+        .commit_create_buffer(
             &author,
             &committer,
             &c.message().valid_utf8()?,
@@ -113,46 +50,63 @@ fn try_commit(repo: &Repository, c: &Commit, target_zeros: u32) -> Result<Oid> {
                 .iter()
                 .collect::<Vec<&Commit>>()
                 .as_slice(),
-        )?,
-    )?;
+        )?
+        .as_str()
+        .valid_utf8()?
+        .to_owned();
 
-    let mut author_offset_idx = 0;
-    let mut committer_offset_idx = 0;
-    let author_ts = author.when().seconds();
-    let mut committer_ts = author_ts;
+    let mut nonce = 1;
+    let nonce_idx = match buf.find("-----BEGIN PGP SIGNATURE-----") {
+        Some(pgp_idx) => match buf.find("Nonce") {
+            Some(idx) => idx + 7,
+            None => {
+                let pgp_header_end = pgp_idx + buf[pgp_idx..].find("\n").unwrap();
+                buf.insert_str(
+                    pgp_header_end,
+                    "\nNonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                );
+                pgp_header_end + 8
+            }
+        },
+        None => match buf.find("nonce") {
+            Some(idx) => idx + 6,
+            None => {
+                let header_end = buf.find("\n\n").unwrap();
+                buf.insert_str(
+                    header_end,
+                    "\nnonce AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                );
+                header_end + 7
+            }
+        },
+    };
 
-    let mut num_hashes = 0;
     loop {
-        buf.set_author_timestamp(author_ts, TZ_OFFSETS[author_offset_idx]);
-        buf.set_committer_timestamp(committer_ts, TZ_OFFSETS[committer_offset_idx]);
+        buf.replace_range(nonce_idx..nonce_idx + 40, &nonce_string(nonce));
         let hash = Oid::hash_object(ObjectType::Commit, buf.as_bytes())?;
         let zeros = num_leading_zero_bits(&hash);
         if zeros >= target_zeros {
-            println!("{} {}", num_hashes, zeros);
-            println!("{}", &*buf);
-            buf.write_to_odb()?;
+            println!("{} {}", nonce, zeros);
+            println!("{}", buf);
+
+            let odb = repo.odb()?;
+            let mut writer = odb.writer(buf.len(), ObjectType::Commit)?;
+            writer.write(&buf.as_bytes())?;
+            writer.finalize()?;
+
             let object = repo.find_object(hash, None)?;
             repo.reset(&object, ResetType::Soft, None)?;
             return Ok(hash);
         }
 
-        author_offset_idx += 1;
-        num_hashes += 1;
-        if author_offset_idx == TZ_OFFSETS.len() {
-            author_offset_idx = 0;
-            committer_offset_idx += 1;
-        }
-        if committer_offset_idx == TZ_OFFSETS.len() {
-            committer_offset_idx = 0;
-            committer_ts += 1;
-        }
+        nonce += 1;
     }
 }
 
 fn main() -> Result<()> {
     let repo = Repository::open(std::env::current_dir()?)?;
     let head_commit = repo.head()?.peel_to_commit()?;
-    let hash = try_commit(&repo, &head_commit, 24)?;
+    let hash = try_commit(&repo, &head_commit, 20)?;
     println!("found {}", hash);
     Ok(())
 }
