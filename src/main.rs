@@ -14,24 +14,36 @@ fn num_leading_zero_bits(oid: &Oid) -> u32 {
     zeros
 }
 
-fn nonce_string(nonce: u128) -> String {
-    let alphabet = "ABCDEFGHIJKLMNOP";
-    let mut nonce_string = String::new();
+fn nonce_bytes(nonce: u128) -> [u8; 32] {
+    let mut nonce_bytes = [b'A'; 32];
     // only covers 128/160 bits of entropy
+    // possible chars: ABCDEFGHIJKLMNOP
     for i in 0..32 {
         let idx = (nonce >> (4 * i)) & 0xF;
-        nonce_string.insert(0, alphabet.chars().nth(idx as usize).unwrap());
+        nonce_bytes[31 - i] = b'A' + idx as u8;
     }
-    nonce_string
+    nonce_bytes
 }
 
-fn write_nonce(buf: &mut String, start: usize, val: u128) {
-    let end = start + buf[start..].find("\n").unwrap();
-    buf.replace_range(start..end, &nonce_string(val));
+fn write_nonce(buf: &mut String, start: usize, val: u128, first: &mut bool) {
+    let nonce_bytes = nonce_bytes(val);
+    let end = if *first {
+        *first = false;
+        start + buf[start..].find("\n").unwrap()
+    } else {
+        start + 32
+    };
+    if end - start != 32 {
+        let nonce_string: String = nonce_bytes.iter().map(|c| *c as char).collect();
+        buf.replace_range(start..end, &nonce_string);
+    } else {
+        // SAFETY: The nonce is always valid UTF-8
+        unsafe { buf[start..end].as_bytes_mut() }.copy_from_slice(&nonce_bytes);
+    }
 }
 
 fn try_commit(mut buf: String, target_zeros: u32) -> Result<(String, Oid)> {
-    let nonce_start = match buf.find("-----BEGIN PGP SIGNATURE-----") {
+    let start = match buf.find("-----BEGIN PGP SIGNATURE-----") {
         Some(pgp_idx) => match buf[pgp_idx..].find("Nonce") {
             Some(idx) => pgp_idx + idx + 7,
             None => {
@@ -64,12 +76,13 @@ fn try_commit(mut buf: String, target_zeros: u32) -> Result<(String, Oid)> {
         let num_hashes = Arc::clone(&num_hashes);
         let mut buf = buf.clone();
         std::thread::spawn(move || {
+            let mut first = true;
             for nonce in i * chunk_size..(i + 1) * chunk_size {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
                 num_hashes.fetch_add(1, Ordering::Relaxed);
-                write_nonce(&mut buf, nonce_start, nonce);
+                write_nonce(&mut buf, start, nonce, &mut first);
                 let hash = Oid::hash_object(ObjectType::Commit, buf.as_bytes()).unwrap();
                 let zeros = num_leading_zero_bits(&hash);
                 if zeros >= target_zeros {
