@@ -9,3 +9,6 @@ edition = "2018"
 anyhow = "1.0.41"
 git2 = "0.13"
 rayon = "1.5.1"
+
+[profile.release]
+debug = true

@@ -31,22 +31,24 @@ fn write_nonce(buf: &mut String, start: usize, val: u128) {
 
 fn try_commit(mut buf: String, target_zeros: u32) -> Result<(String, Oid)> {
     let nonce_start = match buf.find("-----BEGIN PGP SIGNATURE-----") {
-        Some(pgp_idx) => match buf.find("Nonce") {
-            Some(idx) => idx + 7,
+        Some(pgp_idx) => match buf[pgp_idx..].find("Nonce") {
+            Some(idx) => pgp_idx + idx + 7,
             None => {
                 let pgp_header_end = pgp_idx + buf[pgp_idx..].find("\n ").unwrap();
                 buf.insert_str(pgp_header_end, "\nNonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
                 pgp_header_end + 8
             }
         },
-        None => match buf.find("nonce") {
-            Some(idx) => idx + 6,
-            None => {
-                let header_end = buf.find("\n\n").unwrap();
-                buf.insert_str(header_end, "\nnonce AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-                header_end + 7
+        None => {
+            let header_end = buf.find("\n\n").unwrap();
+            match buf.find("nonce") {
+                Some(idx) => idx + 6,
+                None => {
+                    buf.insert_str(header_end, "\nnonce AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+                    header_end + 7
+                }
             }
-        },
+        }
     };
 
     let good_nonce = (0..u128::MAX)
@@ -75,13 +77,10 @@ fn main() -> Result<()> {
     let commit_data = odb.read(head_commit_hash)?.data().iter().cloned().collect();
     let buf = String::from_utf8(commit_data)?;
 
-    let target_zeros = 32;
-    if num_leading_zero_bits(&head_commit_hash) < target_zeros {
-        let (buf, hash) = try_commit(buf.clone(), target_zeros)?;
-        odb.write(ObjectType::Commit, buf.as_bytes())?;
-        let object = repo.find_object(hash, None)?;
-        repo.reset(&object, ResetType::Soft, None)?;
-        println!("found {}", hash);
-    }
+    let target_zeros = 24;
+    let (buf, hash) = try_commit(buf.clone(), target_zeros)?;
+    odb.write(ObjectType::Commit, buf.as_bytes())?;
+    repo.reset(&repo.find_object(hash, None)?, ResetType::Soft, None)?;
+    println!("found {}", hash);
     Ok(())
 }
