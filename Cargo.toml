@@ -9,6 +9,7 @@ edition = "2018"
 anyhow = "1.0.41"
 git2 = "0.13"
 num_cpus = "1.13.0"
+sha-1 = "0.9.6"
 
 [profile.release]
 debug = true
