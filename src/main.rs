@@ -4,6 +4,7 @@ use sha1::{Digest, Sha1};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 const NONCE_LENGTH: usize = 32;
 
@@ -88,9 +89,9 @@ impl fmt::Display for CommitBuffer {
     }
 }
 
-fn num_leading_zero_bits(oid: &Oid) -> u32 {
+fn num_leading_zero_bits(hash: &[u8]) -> u32 {
     let mut zeros = 0;
-    for &byte in oid.as_bytes() {
+    for &byte in hash.iter() {
         zeros += byte.leading_zeros();
         if byte != 0 {
             break;
@@ -100,13 +101,14 @@ fn num_leading_zero_bits(oid: &Oid) -> u32 {
 }
 
 fn try_commit(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid)> {
+    let start_time = Instant::now();
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let num_hashes = Arc::new(AtomicU64::new(0));
 
-    let n = num_cpus::get() as u128;
-    let chunk_size = u128::MAX / n;
-    for i in 0..n {
+    let num_threads = num_cpus::get() as u128;
+    let chunk_size = u128::MAX / num_threads;
+    for i in 0..num_threads {
         let tx = tx.clone();
         let stop = Arc::clone(&stop);
         let num_hashes = Arc::clone(&num_hashes);
@@ -120,10 +122,8 @@ fn try_commit(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, 
                 num_hashes.fetch_add(1, Ordering::Relaxed);
                 commit.write_nonce(nonce);
                 hasher.update(&commit.buf);
-                let hash = Oid::from_bytes(hasher.finalize_reset().as_slice())?;
-                let zeros = num_leading_zero_bits(&hash);
-                if zeros >= target_zeros {
-                    println!("{}", nonce);
+                let hash = hasher.finalize_reset();
+                if num_leading_zero_bits(hash.as_slice()) >= target_zeros {
                     tx.send(commit)?;
                     break;
                 }
@@ -135,12 +135,16 @@ fn try_commit(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, 
     stop.store(true, Ordering::Relaxed);
 
     let hash = Oid::hash_object(ObjectType::Commit, buf.bytes())?;
+    let num_zeros = num_leading_zero_bits(&hash.as_bytes());
+    let num_hashes = num_hashes.load(Ordering::Relaxed);
+    let num_seconds = Instant::now().duration_since(start_time).as_millis() as f64 / 1000.0;
+    println!("Found {} ({} leading zeros)", hash, num_zeros);
     println!(
-        "{} {}",
-        num_hashes.load(Ordering::Relaxed),
-        num_leading_zero_bits(&hash)
+        "{} attempts / {} seconds = {:.3}MH/s",
+        num_hashes,
+        num_seconds,
+        num_hashes as f64 / 1_000_000.0 / num_seconds as f64
     );
-    println!("{}", buf);
     Ok((buf, hash))
 }
 
@@ -158,6 +162,5 @@ fn main() -> Result<()> {
     let (buf, hash) = try_commit(buf, target_zeros)?;
     odb.write(ObjectType::Commit, buf.bytes())?;
     repo.reset(&repo.find_object(hash, None)?, ResetType::Soft, None)?;
-    println!("found {}", hash);
     Ok(())
 }
