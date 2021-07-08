@@ -92,6 +92,7 @@ impl CommitBuffer {
     }
 
     fn bytes(&self) -> &[u8] {
+        // We just want the commit data itself, minus the prepended metadata header
         self.buf[self.header_len..].as_bytes()
     }
 }
@@ -133,13 +134,18 @@ fn run_pow(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid
         std::thread::spawn(move || -> Result<()> {
             let mut hasher = Sha1::new();
             for nonce in i * chunk_size..(i + 1) * chunk_size {
+                // Check if a hash was already found by another thread
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
                 num_hashes.fetch_add(1, Ordering::Relaxed);
+
+                // Write the nonce to the commit buffer and hash the buffer
                 commit.write_nonce(nonce);
                 hasher.update(&commit.buf);
                 let hash = hasher.finalize_reset();
+
+                // Check against our win condition
                 let num_zeros = num_leading_zero_bits(hash.as_slice());
                 if num_zeros >= target_zeros {
                     tx.send((commit, hash, num_zeros))?;
@@ -152,6 +158,7 @@ fn run_pow(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid
     let (buf, hash, num_zeros) = rx.recv()?;
     stop.store(true, Ordering::Relaxed);
 
+    // Print out some statistics once we're done
     let hash = Oid::from_bytes(hash.as_slice())?;
     let num_hashes = num_hashes.load(Ordering::Relaxed);
     let num_seconds = Instant::now().duration_since(start_time).as_millis() as f64 / 1000.0;
@@ -174,8 +181,10 @@ fn main() -> Result<()> {
     let head_commit_hash = repo.head()?.peel_to_commit()?.id();
     let odb = repo.odb()?;
     let buf = CommitBuffer::new(odb.read(head_commit_hash)?.data())?;
-
     let target_zeros = args[1].parse()?;
+
+    // Find the hash we're looking for, then commit the buffer to the git object db,
+    // and finally soft reset to point HEAD to the new commit.
     let (buf, hash) = run_pow(buf, target_zeros)?;
     odb.write(ObjectType::Commit, buf.bytes())?;
     repo.reset(&repo.find_object(hash, None)?, ResetType::Soft, None)?;
