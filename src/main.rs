@@ -1,8 +1,10 @@
 use anyhow::{Error, Result};
 use git2::{ObjectType, Oid, Repository, ResetType};
 use sha1::{Digest, Sha1};
+use std::convert::TryInto;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::io::{stdout, Write};
+use std::sync::atomic::*;
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
@@ -103,7 +105,12 @@ impl fmt::Display for CommitBuffer {
     }
 }
 
-fn num_leading_zero_bits(hash: &[u8]) -> u32 {
+enum PowMessage {
+    Update([u8; 20], u16),
+    Done(CommitBuffer, [u8; 20]),
+}
+
+fn num_leading_zero_bits(hash: &[u8]) -> u16 {
     let mut zeros = 0;
     for &byte in hash.iter() {
         zeros += byte.leading_zeros();
@@ -111,14 +118,15 @@ fn num_leading_zero_bits(hash: &[u8]) -> u32 {
             break;
         }
     }
-    zeros
+    zeros as u16
 }
 
-fn run_pow(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid)> {
+fn run_pow(commit: CommitBuffer, target_zeros: u16) -> Result<(CommitBuffer, Oid)> {
     let start_time = Instant::now();
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let num_hashes = Arc::new(AtomicU64::new(0));
+    let max_zeros = Arc::new(AtomicU16::new(0));
 
     // We divide the range of possible nonces evenly among each thread. Each thread loops
     // through each nonce in its given range and calculates a hash, and if it satisfies the
@@ -130,6 +138,7 @@ fn run_pow(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid
         let tx = tx.clone();
         let stop = Arc::clone(&stop);
         let num_hashes = Arc::clone(&num_hashes);
+        let max_zeros = Arc::clone(&max_zeros);
         let mut commit = commit.clone();
         std::thread::spawn(move || -> Result<()> {
             // Since the part of the commit before the nonce never changes,
@@ -147,33 +156,50 @@ fn run_pow(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid
                 commit.write_nonce(nonce);
                 let mut hasher = hasher.clone();
                 hasher.update(&commit.buf[commit.nonce_start..]);
-                let hash = hasher.finalize();
+                let hash: [u8; 20] = hasher.finalize().as_slice().try_into()?;
 
                 // Check against our win condition
-                let num_zeros = num_leading_zero_bits(hash.as_slice());
+                let num_zeros = num_leading_zero_bits(&hash);
+                if num_zeros > max_zeros.load(Ordering::Relaxed) {
+                    tx.send(PowMessage::Update(hash, num_zeros))?;
+                    max_zeros.store(num_zeros, Ordering::Relaxed);
+                }
                 if num_zeros >= target_zeros {
-                    tx.send((commit, hash, num_zeros))?;
+                    tx.send(PowMessage::Done(commit, hash))?;
                     break;
                 }
             }
             Ok(())
         });
     }
-    let (buf, hash, num_zeros) = rx.recv()?;
-    stop.store(true, Ordering::Relaxed);
-
-    // Print out some statistics once we're done
-    let hash = Oid::from_bytes(hash.as_slice())?;
-    let num_hashes = num_hashes.load(Ordering::Relaxed);
-    let num_seconds = Instant::now().duration_since(start_time).as_millis() as f64 / 1000.0;
-    println!("Found {} ({} leading zeros)", hash, num_zeros);
-    println!(
-        "{} attempts / {} seconds = {:.3}MH/s",
-        num_hashes,
-        num_seconds,
-        num_hashes as f64 / 1_000_000.0 / num_seconds as f64
-    );
-    Ok((buf, hash))
+    let mut stdout = stdout();
+    loop {
+        match rx.recv()? {
+            PowMessage::Update(hash, num_zeros) => {
+                let hash = Oid::from_bytes(&hash)?;
+                print!(
+                    "\rFound {} ({}/{} leading zeros)",
+                    hash, num_zeros, target_zeros
+                );
+                stdout.flush().unwrap();
+            }
+            PowMessage::Done(buf, hash) => {
+                stop.store(true, Ordering::Relaxed);
+                // Print out some statistics once we're done
+                let num_hashes = num_hashes.load(Ordering::Relaxed);
+                let num_seconds =
+                    Instant::now().duration_since(start_time).as_millis() as f64 / 1000.0;
+                println!(
+                    "\n{} attempts / {} seconds = {:.3}MH/s",
+                    num_hashes,
+                    num_seconds,
+                    num_hashes as f64 / 1_000_000.0 / num_seconds as f64
+                );
+                let hash = Oid::from_bytes(&hash)?;
+                return Ok((buf, hash));
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
