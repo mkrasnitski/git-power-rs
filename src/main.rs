@@ -168,7 +168,7 @@ fn run_pow(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        return Err(Error::msg("Usage: git power [bits]"));
+        return Err(Error::msg("Usage: git power <bits>"));
     }
     let repo = Repository::open(std::env::current_dir()?)?;
     let head_commit_hash = repo.head()?.peel_to_commit()?.id();
