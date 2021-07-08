@@ -4,7 +4,7 @@
 Make your git tree into a blockchain! Inspired by [this project](https://github.com/CouleeApps/git-power), I noticed that there was a call to Rewrite it in Rust™, so I decided to tackle it as a way to learn about multithreading in Rust. More details on the What and Why can be found in the above repo.
 
 ## How fast does it go?
-On my Ryzen 3600 @ 3.6 GHz with 12 threads, it achieves 35 MH/s peak, with this figure decreasing for longer commit messages (this includes signed commits). So, if you want to set the leading 8 digits of your commit to 0, that's 2^32 / 35000000 ~= 2 minutes, though variance is pretty high depending on the commit in question.
+On my Ryzen 3600 @ 3.6 GHz with 12 threads, it achieves 54 MH/s peak, with this figure decreasing for longer commit messages (this includes signed commits). So, if you want to set the leading 8 digits of your commit to 0, that's 2^32 / 54000000 ~= 80 seconds, though variance is pretty high depending on the commit in question.
 
 ## Building
 Just run `cargo build`.

@@ -86,20 +86,20 @@ impl CommitBuffer {
             let idx = (val >> (4 * i)) & 0xF;
             nonce_bytes[31 - i] = b'A' + idx as u8;
         }
-        // SAFETY: The nonce is always valid ASCII
+        // SAFETY: The nonce is always valid ASCII, and contain no multi-byte codepoints
         unsafe { self.buf[self.nonce_start..self.nonce_end].as_bytes_mut() }
             .copy_from_slice(&nonce_bytes);
     }
 
-    fn bytes(&self) -> &[u8] {
+    fn data(&self) -> &str {
         // We just want the commit data itself, minus the prepended metadata header
-        self.buf[self.header_len..].as_bytes()
+        &self.buf[self.header_len..]
     }
 }
 
 impl fmt::Display for CommitBuffer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", &self.buf[self.header_len..])
+        write!(f, "{}", self.data())
     }
 }
 
@@ -132,7 +132,10 @@ fn run_pow(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid
         let num_hashes = Arc::clone(&num_hashes);
         let mut commit = commit.clone();
         std::thread::spawn(move || -> Result<()> {
+            // Since the part of the commit before the nonce never changes,
+            // we reuse the SHA-1 state computed up to the nonce's location.
             let mut hasher = Sha1::new();
+            hasher.update(&commit.buf[..commit.nonce_start]);
             for nonce in i * chunk_size..(i + 1) * chunk_size {
                 // Check if a hash was already found by another thread
                 if stop.load(Ordering::Relaxed) {
@@ -142,8 +145,9 @@ fn run_pow(commit: CommitBuffer, target_zeros: u32) -> Result<(CommitBuffer, Oid
 
                 // Write the nonce to the commit buffer and hash the buffer
                 commit.write_nonce(nonce);
-                hasher.update(&commit.buf);
-                let hash = hasher.finalize_reset();
+                let mut hasher = hasher.clone();
+                hasher.update(&commit.buf[commit.nonce_start..]);
+                let hash = hasher.finalize();
 
                 // Check against our win condition
                 let num_zeros = num_leading_zero_bits(hash.as_slice());
@@ -186,7 +190,7 @@ fn main() -> Result<()> {
     // Find the hash we're looking for, then commit the buffer to the git object db,
     // and finally soft reset to point HEAD to the new commit.
     let (buf, hash) = run_pow(buf, target_zeros)?;
-    odb.write(ObjectType::Commit, buf.bytes())?;
+    odb.write(ObjectType::Commit, buf.data().as_bytes())?;
     repo.reset(&repo.find_object(hash, None)?, ResetType::Soft, None)?;
     Ok(())
 }
