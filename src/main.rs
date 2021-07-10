@@ -7,8 +7,18 @@ use std::io::{stdout, Write};
 use std::sync::atomic::*;
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
+use structopt::StructOpt;
 
 const NONCE_LENGTH: usize = 32;
+
+#[derive(StructOpt)]
+struct Config {
+    #[structopt(short, long, default_value = "32")]
+    bits: u16,
+
+    #[structopt(short, long)]
+    threads: Option<u8>,
+}
 
 #[derive(Clone)]
 struct CommitBuffer {
@@ -121,18 +131,19 @@ fn num_leading_zero_bits(hash: &[u8]) -> u16 {
     zeros as u16
 }
 
-fn run_pow(commit: CommitBuffer, target_zeros: u16) -> Result<(CommitBuffer, Oid)> {
+fn run_pow(commit: CommitBuffer, config: &Config) -> Result<(CommitBuffer, Oid)> {
     let start_time = Instant::now();
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let num_hashes = Arc::new(AtomicU64::new(0));
     let max_zeros = Arc::new(AtomicU16::new(0));
+    let target_zeros = config.bits;
 
     // We divide the range of possible nonces evenly among each thread. Each thread loops
     // through each nonce in its given range and calculates a hash, and if it satisfies the
     // POW requirement, sends it to the main thread. When this happens, we stop all other
     // threads using the AtomicBool `stop`.
-    let num_threads = num_cpus::get() as u128;
+    let num_threads = config.threads.unwrap_or(num_cpus::get() as u8) as u128;
     let chunk_size = u128::MAX / num_threads;
     for i in 0..num_threads {
         let tx = tx.clone();
@@ -179,7 +190,7 @@ fn run_pow(commit: CommitBuffer, target_zeros: u16) -> Result<(CommitBuffer, Oid
                 let hash = Oid::from_bytes(&hash)?;
                 print!(
                     "\rFound {} ({}/{} leading zeros)",
-                    hash, num_zeros, target_zeros
+                    hash, num_zeros, config.bits
                 );
                 stdout.flush().unwrap();
             }
@@ -203,19 +214,15 @@ fn run_pow(commit: CommitBuffer, target_zeros: u16) -> Result<(CommitBuffer, Oid
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        return Err(Error::msg("Usage: git power <bits>"));
-    }
+    let config = Config::from_args();
     let repo = Repository::open(std::env::current_dir()?)?;
     let head_commit_hash = repo.head()?.peel_to_commit()?.id();
     let odb = repo.odb()?;
     let buf = CommitBuffer::new(odb.read(head_commit_hash)?.data())?;
-    let target_zeros = args[1].parse()?;
 
     // Find the hash we're looking for, then commit the buffer to the git object db,
     // and finally soft reset to point HEAD to the new commit.
-    let (buf, hash) = run_pow(buf, target_zeros)?;
+    let (buf, hash) = run_pow(buf, &config)?;
     odb.write(ObjectType::Commit, buf.data().as_bytes())?;
     repo.reset(&repo.find_object(hash, None)?, ResetType::Soft, None)?;
     Ok(())

@@ -14,9 +14,20 @@ Run `cargo install --path .`, and the binary will be copied to `$CARGO_HOME/bin`
 
 ## Usage
 
-    git power <bits>
+    git-power 0.1.0
 
-This will brute-force the HEAD commit of the repository located in the current directory, and will use all available logical cores to perform the computation. If you want to apply this to multiple commits at a time, and not just the most recent one, perform an interactive rebase like so:
+    USAGE:
+        git-power [OPTIONS]
+
+    FLAGS:
+        -h, --help       Prints help information
+        -V, --version    Prints version information
+
+    OPTIONS:
+        -b, --bits <bits>           [default: 32]
+        -t, --threads <threads>
+
+By default, git powre will brute-force the HEAD commit of the repository located in the current directory to start with 32 zero bits, and will use all available logical cores to perform the computation. If you want to apply this to multiple commits at a time, and not just the most recent one, perform an interactive rebase like so:
 
     git rebase --interactive --exec "git power" <ref>
 
